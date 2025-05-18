@@ -1,454 +1,122 @@
-===== 【機能①】取引一覧画面 フィルター機能 =====
-
-1. TradeController.java
---------------------------------------------------
-@Controller
-public class TradeController {
-
-    @Autowired
-    private TradeRepository tradeRepository;
-
-    @Autowired
-    private StockRepository stockRepository;
-
-    @GetMapping("/trade")
-    public String tradeList(@RequestParam(required = false) String ticker,
-                            @RequestParam(defaultValue = "all") String date,
-                            Model model) {
-        List<Trade> trades;
-
-        // フィルター条件なし：全件取得
-        if ((ticker == null || ticker.isEmpty()) && date.equals("all")) {
-            trades = tradeRepository.findAll();
-        }
-        // 日付 = today（当日のみ取得）
-        else if (date.equals("today")) {
-            LocalDate today = LocalDate.now();
-            LocalDateTime start = today.atStartOfDay();
-            LocalDateTime end = today.atTime(LocalTime.MAX);
-
-            if (ticker == null || ticker.isEmpty()) {
-                trades = tradeRepository.findByTradedDatetimeBetween(start, end);
-            } else {
-                trades = tradeRepository.findByTickerAndTradedDatetimeBetween(ticker, start, end);
-            }
-        }
-        // Ticker のみで検索
-        else {
-            trades = tradeRepository.findByTickerContaining(ticker);
-        }
-
-        model.addAttribute("trades", trades);
-        return "trade";
-    }
-}
---------------------------------------------------
-
-2. TradeRepository.java
---------------------------------------------------
-public interface TradeRepository extends JpaRepository<Trade, Integer> {
-
-    List<Trade> findByTradedDatetimeBetween(LocalDateTime start, LocalDateTime end); // ★追加
-
-    @Query("SELECT t FROM Trade t WHERE t.stock.ticker = :ticker AND t.tradedDatetime BETWEEN :start AND :end")
-    List<Trade> findByTickerAndTradedDatetimeBetween(@Param("ticker") String ticker,
-                                                      @Param("start") LocalDateTime start,
-                                                      @Param("end") LocalDateTime end); // ★追加
-
-    @Query("SELECT t FROM Trade t WHERE t.stock.ticker LIKE %:ticker%")
-    List<Trade> findByTickerContaining(@Param("ticker") String ticker); // ★追加
-}
---------------------------------------------------
-
-3. trade.html（HTML テンプレート冒頭に追加）
---------------------------------------------------
-<form method="get" action="/trade">
-  <input type="text" name="ticker" placeholder="Ticker（任意）"/>
-  <label><input type="radio" name="date" value="all" checked> All</label>
-  <label><input type="radio" name="date" value="today"> Today</label>
-  <button type="submit" style="background-color:#ccffcc;">フィルター</button>
-</form>
---------------------------------------------------
-
-
-===== 【機能②】取引入力 validation追加 =====
-
-1. WithinIssuedLimit.java（annotation/ 配下に新規作成）
---------------------------------------------------
-@Target({ElementType.TYPE})
-@Retention(RetentionPolicy.RUNTIME)
-@Constraint(validatedBy = WithinIssuedLimitValidator.class)
-public @interface WithinIssuedLimit {
-    String message() default "保有数と入力数の合計が発行済株式数を超えています。";
-    Class<?>[] groups() default {};
-    Class<? extends Payload>[] payload() default {};
-}
---------------------------------------------------
-
-2. WithinIssuedLimitValidator.java
---------------------------------------------------
-public class WithinIssuedLimitValidator implements ConstraintValidator<WithinIssuedLimit, TradeInputDto> {
-
-    @Autowired
-    private StockRepository stockRepository;
-
-    @Autowired
-    private TradeRepository tradeRepository;
-
-    @Override
-    public boolean isValid(TradeInputDto dto, ConstraintValidatorContext context) {
-        Stock stock = stockRepository.findByTicker(dto.getTicker());
-        if (stock == null) return true;
-
-        Long held = tradeRepository.getHoldingQuantityByTicker(dto.getTicker());
-        if (held == null) held = 0L;
-
-        return held + dto.getQuantity() <= stock.getSharesIssued();
-    }
-}
---------------------------------------------------
-
-3. TradeRepository.java（機能①に追加でさらに以下を追加）
---------------------------------------------------
-@Query("SELECT COALESCE(SUM(CASE WHEN t.side = 'BUY' THEN t.quantity ELSE -t.quantity END), 0) " +
-       "FROM Trade t WHERE t.stock.ticker = :ticker")
-Long getHoldingQuantityByTicker(@Param("ticker") String ticker); // ★追加
---------------------------------------------------
-
-4. TradeInputDto.java（クラスにアノテーション追加）
---------------------------------------------------
-@WithinIssuedLimit // ★追加：クラスの上に追加
-public class TradeInputDto {
-
-    @NotNull
-    private String ticker;
-
-    @NotNull
-    private LocalDateTime tradedDatetime;
-
-    @NotNull
-    private String side;
-
-    @NotNull
-    private Long quantity;
-
-    @NotNull
-    private BigDecimal tradedPrice;
-
-    // getter/setter...
-}
---------------------------------------------------
-
-
-===== 【機能③】時価一括登録画面（/marketprice/bulk） =====
-
-1. HTML（templates/marketprice_bulk.html）
---------------------------------------------------
-<!DOCTYPE html>
-<html xmlns:th="http://www.thymeleaf.org">
-<head>
-    <meta charset="UTF-8">
-    <title>Market Price Bulk Register</title>
-</head>
-<body>
-<h1>Market Price Register</h1>
-
-<form method="post" action="/marketprice/bulk">
-    <label for="bulkText">Market Price</label><br/>
-    <textarea id="bulkText" name="bulkText" rows="10" cols="50" placeholder="2432,1500.00
-4523,1200.50
-..."></textarea><br/><br/>
-    <button type="submit">Register</button>
-</form>
-
-<div th:if="${error}" style="color:red;" th:text="${error}"></div>
-</body>
-</html>
---------------------------------------------------
-
-2. MarketPriceController.java（新規作成）
---------------------------------------------------
-@Controller
-public class MarketPriceController {
-
-    @Autowired
-    private StockRepository stockRepository;
-
-    @Autowired
-    private MarketPriceRepository marketPriceRepository;
-
-    @GetMapping("/marketprice/bulk")
-    public String showBulkForm() {
-        return "marketprice_bulk";
-    }
-
-    @PostMapping("/marketprice/bulk")
-    public String registerMarketPrices(@RequestParam String bulkText, Model model) {
-        if (bulkText == null || bulkText.isBlank()) {
-            model.addAttribute("error", "入力が空です。");
-            return "marketprice_bulk";
-        }
-
-        String[] lines = bulkText.split("\r?\n");
-        Set<String> seenTickers = new HashSet<>();
-        List<MarketPrice> marketPrices = new ArrayList<>();
-
-        for (String line : lines) {
-            String[] parts = line.trim().split(",");
-            if (parts.length != 2) {
-                model.addAttribute("error", "列数が正しくありません: " + line);
-                return "marketprice_bulk";
-            }
-
-            String ticker = parts[0].trim();
-            String priceStr = parts[1].trim();
-
-            if (ticker.isEmpty() || seenTickers.contains(ticker)) {
-                model.addAttribute("error", "空のtickerまたは重複があります: " + ticker);
-                return "marketprice_bulk";
-            }
-
-            seenTickers.add(ticker);
-
-            BigDecimal price;
-            try {
-                price = new BigDecimal(priceStr);
-                if (price.scale() > 2 || price.compareTo(BigDecimal.ZERO) < 0) {
-                    throw new NumberFormatException();
-                }
-            } catch (NumberFormatException e) {
-                model.addAttribute("error", "不正な価格形式です: " + priceStr);
-                return "marketprice_bulk";
-            }
-
-            Stock stock = stockRepository.findByTicker(ticker);
-            if (stock == null) {
-                model.addAttribute("error", "存在しないtickerです: " + ticker);
-                return "marketprice_bulk";
-            }
-
-            MarketPrice mp = new MarketPrice();
-            mp.setStock(stock);
-            mp.setMarketPrice(price);
-            mp.setCreatedDatetime(LocalDateTime.now());
-
-            marketPrices.add(mp);
-        }
-
-        marketPriceRepository.saveAll(marketPrices);
-        return "redirect:/positions";
-    }
-}
---------------------------------------------------
-
-3. MarketPrice.java（model 配下に新規作成）
---------------------------------------------------
-@Entity
-public class MarketPrice {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Integer id;
-
-    @ManyToOne
-    @JoinColumn(name = "stock_id", nullable = false)
-    private Stock stock;
-
-    @Column(name = "market_price", nullable = false, precision = 10, scale = 2)
-    private BigDecimal marketPrice;
-
-    @Column(name = "created_datetime", nullable = false)
-    private LocalDateTime createdDatetime = LocalDateTime.now();
-
-    // getter/setter
-    public Integer getId() { return id; }
-    public Stock getStock() { return stock; }
-    public void setStock(Stock stock) { this.stock = stock; }
-    public BigDecimal getMarketPrice() { return marketPrice; }
-    public void setMarketPrice(BigDecimal marketPrice) { this.marketPrice = marketPrice; }
-    public LocalDateTime getCreatedDatetime() { return createdDatetime; }
-    public void setCreatedDatetime(LocalDateTime createdDatetime) { this.createdDatetime = createdDatetime; }
-}
---------------------------------------------------
-
-4. MarketPriceRepository.java（新規作成）
---------------------------------------------------
-public interface MarketPriceRepository extends JpaRepository<MarketPrice, Integer> {
-
-    @Query("SELECT m FROM MarketPrice m WHERE m.stock.id = :stockId ORDER BY m.createdDatetime DESC")
-    List<MarketPrice> findLatestByStockId(@Param("stockId") Integer stockId);
-}
---------------------------------------------------
-
-5. StockRepository.java にメソッド追加（既に存在していれば不要）
---------------------------------------------------
-Stock findByTicker(String ticker);
---------------------------------------------------
-
-
-===== src/main/java/controller/PositionController.java =====
-
-@Controller
-public class PositionController {
-
-    @Autowired
-    private PositionService positionService;
-
-    @GetMapping("/positions")
-    public String showPositions(Model model) {
-        model.addAttribute("positions", positionService.calculatePositions());
-        return "positions";
-    }
-}
-
-
-===== src/main/java/service/PositionService.java =====
-
-@Service
-public class PositionService {
-
-    @Autowired
-    private TradeRepository tradeRepository;
-
-    @Autowired
-    private MarketPriceRepository marketPriceRepository;
-
-    public List<PositionDto> calculatePositions() {
-        List<Trade> trades = tradeRepository.findAllWithStock();
-        Map<Stock, List<Trade>> grouped = trades.stream().collect(Collectors.groupingBy(Trade::getStock));
-
-        List<PositionDto> result = new ArrayList<>();
-
-        for (Stock stock : grouped.keySet()) {
-            List<Trade> stockTrades = grouped.get(stock);
-            PositionDto dto = new PositionDto(stock.getTicker(), stock.getName());
-
-            long quantity = 0;
-            BigDecimal totalBuy = BigDecimal.ZERO;
-            long totalBuyQty = 0;
-            BigDecimal realizedProfit = BigDecimal.ZERO;
-
-            for (Trade t : stockTrades) {
-                if (t.getSide() == Side.BUY) {
-                    quantity += t.getQuantity();
-                    totalBuy = totalBuy.add(t.getTradedPrice().multiply(BigDecimal.valueOf(t.getQuantity())));
-                    totalBuyQty += t.getQuantity();
-                } else {
-                    quantity -= t.getQuantity();
-                    if (totalBuyQty > 0) {
-                        BigDecimal avg = totalBuy.divide(BigDecimal.valueOf(totalBuyQty), 2, RoundingMode.HALF_UP);
-                        BigDecimal profit = (t.getTradedPrice().subtract(avg))
-                                .multiply(BigDecimal.valueOf(t.getQuantity()));
-                        realizedProfit = realizedProfit.add(profit);
-                    }
-                }
-            }
-
-            dto.quantity = quantity;
-            dto.avgPrice = (totalBuyQty > 0) ?
-                totalBuy.divide(BigDecimal.valueOf(totalBuyQty), 2, RoundingMode.HALF_UP) : null;
-            dto.realizedProfit = (realizedProfit.compareTo(BigDecimal.ZERO) == 0) ? null : realizedProfit;
-
-            MarketPrice mp = marketPriceRepository.findLatestByStockId(stock.getId());
-            if (mp != null) {
-                dto.marketPrice = mp.getMarketPrice();
-                if (quantity > 0 && dto.avgPrice != null) {
-                    dto.valuation = mp.getMarketPrice().multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
-                    dto.unrealizedProfit = (mp.getMarketPrice().subtract(dto.avgPrice))
-                            .multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
-                }
-            }
-
-            result.add(dto);
-        }
-
-        result.sort(Comparator.comparing(p -> p.ticker));
-        return result;
-    }
-}
-
-
-===== src/main/java/dto/PositionDto.java =====
-
-public class PositionDto {
-    public String ticker;
-    public String name;
-    public long quantity;
-    public BigDecimal avgPrice;
-    public BigDecimal realizedProfit;
-    public BigDecimal marketPrice;
-    public BigDecimal valuation;
-    public BigDecimal unrealizedProfit;
-
-    public PositionDto(String ticker, String name) {
-        this.ticker = ticker;
-        this.name = name;
-    }
-}
-
-
-===== src/main/java/repository/TradeRepository.java =====
-
-@Query("SELECT t FROM Trade t JOIN FETCH t.stock")
-List<Trade> findAllWithStock();
-
-
-===== src/main/java/repository/MarketPriceRepository.java =====
-
-@Query("SELECT m FROM MarketPrice m WHERE m.stock.id = :stockId ORDER BY m.createdDatetime DESC")
-List<MarketPrice> findLatestByStockId(@Param("stockId") Integer stockId);
-
-
-===== src/main/resources/templates/positions.html =====
-
-<!DOCTYPE html>
-<html xmlns:th="http://www.thymeleaf.org">
-<head>
-    <meta charset="UTF-8">
-    <title>Positions</title>
-    <style>
-        th { text-align: center; }
-        td.right { text-align: right; }
-        td.left { text-align: left; }
-        .red { color: red; }
-        .green { color: green; }
-        .gray { color: gray; }
-    </style>
-</head>
-<body>
-<h1>Positions</h1>
-<table border="1">
-    <thead>
-        <tr>
-            <th>Ticker</th>
-            <th>Name</th>
-            <th>Quantity</th>
-            <th>Average Unit Price</th>
-            <th>Realized P/L</th>
-            <th>Market Price</th>
-            <th>Valuation</th>
-            <th>Unrealized P/L</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr th:each="pos : ${positions}">
-            <td class="left" th:text="${pos.ticker}"></td>
-            <td class="left" th:text="${pos.name}"></td>
-            <td class="right" th:text="${pos.quantity}"></td>
-            <td class="right" th:text="${pos.avgPrice != null ? pos.avgPrice : 'N/A'}"></td>
-            <td class="right"
-                th:classappend="${pos.realizedProfit > 0 ? 'red' : (pos.realizedProfit < 0 ? 'green' : 'gray')}"
-                th:text="${pos.realizedProfit != null ? pos.realizedProfit : 'N/A'}"></td>
-            <td class="right" th:text="${pos.marketPrice != null ? pos.marketPrice : 'N/A'}"></td>
-            <td class="right"
-                th:classappend="${pos.valuation > 0 ? 'red' : (pos.valuation == 0 ? 'gray' : '')}"
-                th:text="${pos.valuation != null ? pos.valuation : 'N/A'}"></td>
-            <td class="right"
-                th:classappend="${pos.unrealizedProfit > 0 ? 'red' : (pos.unrealizedProfit < 0 ? 'green' : 'gray')}"
-                th:text="${pos.unrealizedProfit != null ? pos.unrealizedProfit : 'N/A'}"></td>
-        </tr>
-    </tbody>
-</table>
-</body>
-</html>
-
+アピールポイント
+私の強みは、新しい課題に前向きに取り組む姿勢と、失敗から学び改善につなげる力です。一方で、弱みは複雑な状況下での判断の遅さや、全体を見通した対応が苦手な点にあると感じています。
+【強み】
+•	未知の課題への前向きな姿勢
+得意分野以外のタスクにもまず手を動かして取り組み、必要な知識はその都度キャッチアップしながら対応できるようになった。
+•	失敗から学ぶ力
+一度不合格になった免許皆伝試験に対し、原因を振り返って計画を見直し、再チャレンジで合格できた。
+【弱み】
+•	複雑な課題に対する判断力の弱さ
+複数の要素が絡む場面で、情報整理や判断に時間がかかることがある。
+•	先を見越した対応が苦手
+目の前のことに集中しすぎて、全体の流れや長期的な影響を考慮した判断が遅れることがある。
+【改善の取り組み】
+•	タスクに取りかかる前に、状況整理・目的・優先順位を明確にする習慣をつける。
+•	判断に迷ったときは、まず自分の考えを整理してから周囲に相談し、多面的な視点を取り入れるようにする。
+•	日々の振り返りを通じて、自分の判断の傾向や改善点を把握し、少しずつ精度を上げていく。
+
+现在考虑的之后的目标
+今月中の目標（短期）
+PJ総合では、チームでの成果を最大化するために、自分の役割を明確にしながら行動することを意識する。また、報連相のタイミングや情報共有の仕方など、チームとして動くうえでの基本を丁寧に実践し、メンバー間の連携を円滑に進められるようにする。技術的な成果だけでなく、協働のプロセスにも責任を持って関わり、評価だけでなく実際の貢献実感を持てるような取り組みを目指す。
+研修期間（配属まで）の目標
+配属後すぐに実務に対応できるよう、研修中から「自分で考えて動く力」「限られた時間の中で成果を出す力」を高めていく。特に、目の前の課題に取り組むだけでなく、その背景や目的を意識しながら行動することで、実務に必要な視点や優先順位の判断力を養う。また、振り返りを通じて日々の気づきを次に活かす姿勢を継続し、現場でも継続して学びながら価値を出せる人材を目指す。
+
+Tech
+掌握了的内容
+ウェブアプリケーション開発に必要なJava、SpringBoot、PostgreSQL、HTML、CSS、JavaScriptの基本を習得できた。
+为什么成功掌握了
+ハンズオンで理解できなかった所は、Web記事や公式ドキュメントを調査したり、フリーワーク中に同期とディスカッションしたりすることで、実践を通じて復習・理解を深めた。
+没掌握的内容
+複数のプログラミング言語やフレームワークを柔軟に組み合わせて、実際の要件を的確に実装する能力。特に、要件定義から設計・実装に至る一連の開発プロセスに対する理解がまだ不十分である。
+为了掌握的行动
+プロジェクト総合を通じて、これまでのハンズオンやフリーワークで理解が不十分だった部分を重点的に復習し、実際の開発工程の中で自ら設計・コーディング・検証を行うことで、応用力と課題解決能力を高めていく。
+
+金融
+掌握了的内容
+金融市場、金融機関、債券数学に関する基本を習得できた。Excelを用いて行う債券の単利、複利、満期利回りなどの計算方法を習得できた。
+为什么成功掌握了
+授業中は講義を集中して聴講し、積極的に質問を行った。授業後にはノートや教材を繰り返し読み直し、確実に内容を理解・習得できるよう努めた。
+没掌握的内容
+株式や債券の取引シミュレーションにおいて、ニュースを即時に読み解き、その市場への影響を正しく判断することができず、投資家として迅速かつ適切な取引判断を下すことができなかった。
+为了掌握的行动
+毎日、当日の金融市場に影響を与えるニュースを5本読み、内容の理解に努めている。日経予測フォーキャストにも意識的に取り組み、毎朝、日経先物の動向を確認することで、自分の予測精度を高めていく。
+
+商务交流 三角
+掌握了的内容
+目上の方と会話をする際に、適切な敬語を用いることができるようになった。また、相手の立場に立って、どのように伝えればわかりやすいかを意識しながら会話を行い、傾聴の姿勢を大切にしながら、相手の話を理解する重要性も理解できた。
+为什么成功掌握了
+ビジネス研修を通じて、ビジネスコミュニケーションで使われる敬語の理解が深まった。また、日常的にメンターや同期との会話の中で、伝え方や聞き方に意識を向けることで、実践を積みながら身につけていった。
+没掌握的内容
+会議時の議事録作成に関しては、要点を正確かつ簡潔にまとめる力がまだ不十分である。また、複数人でのディスカッションにおいて、発言が話題の要点から逸れてしまうことがあり、自分の発言がうまく伝わらない際には、やや焦りながら説明してしまう傾向もある。
+为了掌握的行动
+プロジェクト総合を通じて練習を重ね、グループでの協働の中で、自分の発言や伝え方を意識的に改善していく。また、議事録作成が得意なメンバーの書き方や要点整理の方法を参考にし、実践を通じて自らの力として習得していく。
+
+段取り⭕
+掌握了的内容
+第2回免許皆伝試験において、詳細な段取りを事前に立て、計画に沿って着実に作業を進めた結果、目標を無事に達成することができた。
+为什么成功掌握了
+第1回免許皆伝試験不合格となった要因を振り返り、準備の段取りの重要性を認識した上で、フリーワーク期間ごとの達成目標や作業配分を調整した。また、試験の段取りにおいても、進捗状況を適宜確認し、柔軟に対応・修正を加えたことで、計画通りに成果を出すことができた。
+没掌握的内容
+現時点では、自分の作業スピードや得意・不得意を正確に把握した上で、現実的な作業時間を見積もる手法がまだ確立できていない。
+为了掌握的行动
+今後は、自身の能力を客観的に分析し、業務ごとの負荷や所要時間の傾向を記録・可視化することで、より実態に即した段取り（計画立案と進行管理）ができるようにしていく。また、実行後の振り返りを継続的に行い、見積もり精度の向上と段取り力の強化を図る。
+
+Catch up⭕
+体现了的内容
+JavaやSpringBootなど初めて触れる技術について、基礎的な使い方を身につけ、簡単な機能やバリデーションを実装できるようになった。
+为什么成功体现了
+分からないことが出てきた時は、まず自分で動かして確認し、それでも理解できなければドキュメントや記事を調べるようにしていた。また、重要な点は自分の言葉でノートにまとめ直すようにしていた。
+没体现的内容
+概念の複雑な部分（例：DIの仕組みやSQLのJOINの使い分けなど）は、なんとなく使えるようになっても「なぜこうするのか」を深く理解できないまま進めてしまうことがあった。
+为了体现的行动
+書いたコードに対して「これは何をしているのか」「他のやり方ではどうなるのか」と自分に問いかけながら整理する習慣をつける。理解があいまいな部分は自分なりに図解したり、別の例に置き換えたりして、実際に説明できるレベルまで持っていくことを意識する。
+
+Client First 三角
+体现了的内容
+メンターや同期とのやりとりにおいて、丁寧な言葉遣いや態度を意識し、相手に不快感を与えないような対応ができるようになった。
+为什么成功体现了
+日々のコミュニケーションで、「どう伝えたら相手が受け取りやすいか」を考えながら言い回しを選んだり、敬語の使い方を見直すことを続けていたため。
+没体现的内容
+相手の真のニーズを掘り下げて把握する力にまだ課題が残っていると認識しております。会話の中で相手が何を本当に求めているのかを深く考えず、言われたことだけをそのまま受け取ってしまい、意図とずれた対応をしてしまうことがあった。
+为了体现的行动
+指示やアドバイスを受けたときに、その背景や目的を考えるクセをつける。また、「つまりこういうことですか？」と確認する習慣を取り入れ、表面的な理解で終わらせないようにする。
+
+Commitment ⚪
+体现了的内容
+日々の研修課題は、途中で投げ出すことなく最後までやり切ることができた。特に分からない部分があっても、自分で調べたり相談したりしながら、期限内に提出することを意識して行動できた。
+为什么成功体现了
+朝の時点でToDoを整理し、優先順位をつけて少しずつ進めるようにしていた。また、「未完のまま放置しない」を自分の中でルールにしていた。
+没体现的内容
+第1回免許皆伝試験では、準備に必要な時間の見積もりが甘く、実装に時間を取られた結果、復習や細かい調整に十分な時間を確保できなかった。
+为了体现的行动
+計画を立てる際は、各作業にどれくらい時間がかかるかを具体的に想定するようにする。また、実際にかかった時間と照らし合わせて振り返り、次回以降の見積もり精度を少しずつ高めていく。（段取り）
+
+Professionalism 三角
+体现了的内容
+第2回免許皆伝試験において、無事合格水準を達成することができました。JavaやSQLなどの知識に関して、理解があいまいな部分をそのままにせず、調査したり、周囲に確認しながら進めるようにしていた。
+为什么体现了
+毎回の課題後に自分の理解度を振り返る時間を取り、うまく説明できない箇所はノートに書き出して整理する習慣を続けていた。
+没体现的内容
+証券外務員二種試験では、他の課題との並行対応により十分な準備時間が取れず、結果として不合格となってしまった。優先順位の判断にも甘さがあった。
+为了体现的行动
+限られた時間の中でも「何にどれだけ時間をかけるか」を早めに判断し、重要な試験や業務に向けて学習時間を確保できるようにする。また、資格試験範囲を分解して短時間でも継続的に取り組めるよう工夫していく。
+
+Be proactive ⭕
+体现了的内容
+分からないことはそのままにせず、その場で質問して理解できるまで確認するようにしていた。調べてもうまくいかなかった場面では、途中でも一度立ち止まり、手が止まる前に行動できるようになってきた。
+为什么成功体现了
+「理解が曖昧なまま進めると、後でさらに時間がかかる」と考え、早めに聞くことを優先するように意識していたから。実際に相談して解決できた経験を繰り返す中で、その重要性を実感した。
+没体现的内容
+グループワークなど複数人の場面では、自分の意見を伝えることにまだ迷いがあり、発言の機会を逃してしまうことがある。「間違っていたらどうしよう」という不安が先に立ってしまう。
+为了体现的行动
+完成度の高い意見を出そうとするのではなく、「まず一度言葉にしてみる」ことを意識する。発言しないまま終わることがないよう、最初に一言でも発信する癖をつけ、発言への抵抗感を減らしていく。
+
+Flexibility ⭕
+体现了的内容
+フリーワークでは、進める中で仕様の理解不足や想定外のエラーが発生した際にも、一度立ち止まり、調査・順序の変更・手法の見直しなど柔軟に対応することができた。加えて、より効果的な内容についても、自分のやり方に固執せず取り入れるようにしていた。
+为什么成功体现了
+最初に決めた通りに進まないのは当然だと考え、状況やアドバイスに応じてやり方を変えることに抵抗がなくなってきた。うまくいかなかった時にはすぐ別の方法を試してみるようにしていた。
+没体现的内容
+複数のタスクが重なった場面では、それぞれの優先順位や所要時間を見直す余裕がなく、結果として重要な作業（例：試験対策など）への準備時間が足りなくなった。
+为了体现的行动
+タスクが多いときほど、一度立ち止まって「今一番やるべきことは何か」を整理するようにする。また、フィードバックを受けた際はすぐ動くのではなく、一度自分なりに考えた上で取り入れるかどうか判断する習慣をつける。
