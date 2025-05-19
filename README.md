@@ -1,3 +1,111 @@
+import React, { useState, useRef } from 'react';
+import FullCalendar from '@fullcalendar/react';
+import resourceTimelinePlugin from '@fullcalendar/resource-timeline';
+import interactionPlugin from '@fullcalendar/interaction';
+import EventEdit from './EventEditor';
+import '../styles/calendar.css';
+import { FaTrashAlt } from 'react-icons/fa';
+import { ToastContainer, toast } from 'react-toastify';
+import 'react-toastify/dist/ReactToastify.css';
+import { DateFormatterArg } from '@fullcalendar/core';
+
+const Calendar: React.FC = () => {
+  const [events, setEvents] = useState<any[]>([]);
+  const [selectedEventInfo, setSelectedEventInfo] = useState<{
+    eventObj: any;
+    plainObject: any;
+  } | null>(null);
+  const [showEdit, setShowEdit] = useState(false);
+  const trashBinRef = useRef<HTMLDivElement>(null);
+
+  // 第一行：週の範囲（例：05/19 - 05/25）
+  const formatWeekRange = (info: DateFormatterArg): string => {
+    const start = new Date(info.start);
+    const end = new Date(info.start);
+    end.setDate(end.getDate() + 6);
+
+    const pad = (n: number): string => String(n).padStart(2, '0');
+    const startStr = `${pad(start.getMonth() + 1)}/${pad(start.getDate())}`;
+    const endStr = `${pad(end.getMonth() + 1)}/${pad(end.getDate())}`;
+    return `${startStr} - ${endStr}`;
+  };
+
+  // 第二行：日付 + 曜日（日本語）
+  const formatDateWithJapaneseWeekday = (info: DateFormatterArg): string => {
+    const date = new Date(info.date);
+    const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
+    const pad = (n: number): string => String(n).padStart(2, '0');
+    const day = pad(date.getDate());
+    const weekdayJP = daysJP[date.getDay()];
+    return `${day}（${weekdayJP}）`;
+  };
+
+  return (
+    <div>
+      <FullCalendar
+        plugins={[resourceTimelinePlugin, interactionPlugin]}
+        schedulerLicenseKey="GPL-My-Project-Is-Open-Source"
+        initialView="resourceTimelineMonth"
+        views={{
+          resourceTimelineMonth: {
+            slotDuration: { days: 1 },
+            slotLabelInterval: { days: 1 },
+            slotLabelFormat: [
+              { formatter: formatWeekRange },
+              { formatter: formatDateWithJapaneseWeekday }
+            ]
+          }
+        }}
+        resources={[
+          { id: 'a', title: 'リソースA' },
+          { id: 'b', title: 'リソースB' }
+        ]}
+        events={events}
+        editable={true}
+        selectable={true}
+        eventClick={(info) => {
+          setSelectedEventInfo({
+            eventObj: info.event,
+            plainObject: {
+              id: info.event.id,
+              title: info.event.title,
+              start: info.event.start,
+              end: info.event.end,
+              resourceId: info.event.getResources()?.[0]?.id || '',
+            }
+          });
+          setShowEdit(true);
+        }}
+      />
+
+      {showEdit && selectedEventInfo && (
+        <EventEdit
+          eventInfo={selectedEventInfo}
+          onClose={() => setShowEdit(false)}
+          onSave={(updatedEvent) => {
+            setEvents((prevEvents) =>
+              prevEvents.map((e) => (e.id === updatedEvent.id ? updatedEvent : e))
+            );
+            setShowEdit(false);
+            toast.success('イベントを更新しました');
+          }}
+        />
+      )}
+
+      <ToastContainer />
+    </div>
+  );
+};
+
+export default Calendar;
+
+
+.fc .fc-timeline-header .fc-cell-text {
+  white-space: pre-line;
+}
+
+
+
 アピールポイント
 私の強みは、新しい課題に前向きに取り組む姿勢と、失敗から学び改善につなげる力です。一方で、弱みは複雑な状況下での判断の遅さや、全体を見通した対応が苦手な点にあると感じています。
 【強み】
